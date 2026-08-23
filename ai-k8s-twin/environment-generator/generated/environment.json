@@ -1,0 +1,11 @@
+{
+    "service": "paymentservice",
+    "replicas": 3,
+    "cpu_request": "250m",
+    "cpu_limit": "500m",
+    "memory_request": "256Mi",
+    "memory_limit": "512Mi",
+    "requests_per_second": 1500,
+    "network_latency_ms": 20,
+    "packet_loss_percent": 0
+}
