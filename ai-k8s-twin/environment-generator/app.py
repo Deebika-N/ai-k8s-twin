@@ -1,6 +1,14 @@
 import os
 import json
+from pathlib import Path
 from groq import Groq
+
+from config import EnvironmentConfig
+
+
+ROOT = Path(__file__).resolve().parent
+OUTPUT_FILE = ROOT / "generated" / "environment.json"
+DEFAULT_IMAGE = "gcr.io/google-samples/microservices-demo/paymentservice:v0.10.6"
 
 # Connect to Groq
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
@@ -74,17 +82,19 @@ try:
 except json.JSONDecodeError:
     print("Groq did not return valid JSON:")
     print(result)
-    exit(1)
+    raise SystemExit(1)
+
+environment["image"] = DEFAULT_IMAGE
+environment["application_port"] = 50051
+EnvironmentConfig.from_mapping(environment)
 
 # Save JSON
-output_file = "generated/environment.json"
-
-with open(output_file, "w") as file:
+with OUTPUT_FILE.open("w", encoding="utf-8") as file:
     json.dump(environment, file, indent=4)
 
 print("\nEnvironment generated successfully!")
 print(json.dumps(environment, indent=4))
-print(f"\nSaved to: {output_file}")
+print(f"\nSaved to: {OUTPUT_FILE}")
 
 
 

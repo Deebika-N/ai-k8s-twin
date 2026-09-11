@@ -5,6 +5,7 @@
     "cpu_limit": "500m",
     "memory_request": "256Mi",
     "memory_limit": "512Mi",
+    "image": "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/paymentservice:v0.10.6",
     "requests_per_second": 1500,
     "network_latency_ms": 20,
     "packet_loss_percent": 0
