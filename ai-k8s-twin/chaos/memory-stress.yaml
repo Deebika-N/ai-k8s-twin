@@ -1,13 +1,16 @@
 apiVersion: chaos-mesh.org/v1alpha1
-kind: PodChaos
+kind: StressChaos
 metadata:
-  name: kill-simulation-paymentservice
+  name: payment-memory-stress
   namespace: simulation
 spec:
-  action: pod-kill
   mode: one
   selector:
     namespaces:
       - simulation
     labelSelectors:
       app: simulation-paymentservice
+  stressors:
+    memory:
+      size: "256Mi"
+  duration: "2m"
