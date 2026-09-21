@@ -12,5 +12,5 @@ spec:
       app: simulation-paymentservice
   stressors:
     memory:
-      size: "256Mi"
+      size: "256MB"
   duration: "2m"
