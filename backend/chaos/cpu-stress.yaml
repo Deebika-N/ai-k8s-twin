@@ -1,0 +1,23 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+
+metadata:
+  name: {{ chaos_name }}
+  namespace: {{ namespace }}
+
+spec:
+  mode: {{ mode }}
+
+  selector:
+    namespaces:
+      - {{ namespace }}
+
+    labelSelectors:
+      app: {{ target_app }}
+
+  stressors:
+    cpu:
+      workers: {{ workers }}
+      load: {{ cpu_load }}
+
+  duration: "{{ duration }}"
