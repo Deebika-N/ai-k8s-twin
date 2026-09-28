@@ -10,6 +10,17 @@ import yaml
 from git import Repo
 from groq import Groq
 from jinja2 import Environment, FileSystemLoader
+from dotenv import load_dotenv
+
+
+load_dotenv(
+    os.path.join(
+        os.path.dirname(
+            os.path.dirname(__file__)
+        ),
+        ".env"
+    )
+)
 
 
 REPOSITORY_DIRECTORY = os.path.expanduser(
@@ -92,10 +103,12 @@ def clone_repository(github_url):
     ):
 
         print(
-            "Repository already exists. Reusing it."
+            "Removing previous temporary repository..."
         )
 
-        return REPOSITORY_DIRECTORY
+        shutil.rmtree(
+            REPOSITORY_DIRECTORY
+        )
 
     try:
 
@@ -525,6 +538,39 @@ def deploy_application(
         .get("spec", {})
     )
 
+    for container in pod_spec.get(
+        "containers",
+        []
+    ):
+
+        for probe_name in [
+            "readinessProbe",
+            "livenessProbe"
+        ]:
+
+            probe = container.get(
+                probe_name
+            )
+
+            if isinstance(
+                probe,
+                dict
+            ) and (
+                "grpc" in probe
+                or "httpGet" in probe
+                or "tcpSocket" in probe
+            ):
+
+                probe[
+                    "timeoutSeconds"
+                ] = max(
+                    probe.get(
+                        "timeoutSeconds",
+                        1
+                    ),
+                    5
+                )
+
     service_account_name = pod_spec.get(
         "serviceAccountName"
     )
@@ -771,10 +817,11 @@ chaos engineering experiments.
 
 Application:
 {json.dumps(application, indent=2)}
-
+    duration,
+    vus
 Selected environments:
 {json.dumps(environments, indent=2)}
-
+        vus,
 User available CPU:
 {cpu}
 
@@ -1335,6 +1382,12 @@ def build_chaos_parameters(
         application
     )
 
+    target_name = re.sub(
+        r"[^a-z0-9-]+",
+        "-",
+        str(target_app).lower()
+    ).strip("-")
+
     chaos_parameters = {}
 
     for environment in environments:
@@ -1349,7 +1402,9 @@ def build_chaos_parameters(
             environment
         ] = {
             "chaos_name": (
-                environment
+                target_name
+                + "-"
+                + environment
                 .lower()
                 .replace(" ", "-")
                 + "-experiment"
@@ -1554,6 +1609,393 @@ def get_node_count():
     )
 
 
+def collect_result_metrics(
+    application,
+    recovery_result,
+    k6_result=None
+):
+
+    namespace = application.get(
+        "namespace",
+        "default"
+    )
+
+    name = application.get(
+        "name"
+    )
+
+    metrics = {
+        "cpu_avg": None,
+        "cpu_max": None,
+        "memory_avg": None,
+        "memory_max": None,
+        "requests_per_second": None,
+        "p95_latency_ms": None,
+        "p99_latency_ms": None,
+        "error_rate_percent": None,
+        "pod_restarts": 0,
+        "available_replicas": 0,
+        "oom_killed": False,
+        "recovery_time_seconds": (
+            recovery_result.get(
+                "recovery_time_seconds"
+            )
+            if recovery_result
+            else None
+        ),
+        "collection_errors": [],
+        "sources": {
+            "cpu_avg": "kubectl top",
+            "cpu_max": "kubectl top",
+            "memory_avg": "kubectl top",
+            "memory_max": "kubectl top",
+            "requests_per_second": "k6 pending",
+            "p95_latency_ms": "k6 pending",
+            "p99_latency_ms": "k6 pending",
+            "error_rate_percent": "k6 pending",
+            "pod_restarts": "kubectl pod status",
+            "available_replicas": "kubectl deployment status",
+            "oom_killed": "kubectl pod status",
+            "recovery_time_seconds": "Pod Kill recovery timer"
+        }
+    }
+
+    if k6_result and k6_result.get(
+        "status"
+    ) == "completed":
+
+        metrics[
+            "requests_per_second"
+        ] = k6_result.get(
+            "requests_per_second"
+        )
+        metrics[
+            "p95_latency_ms"
+        ] = k6_result.get(
+            "p95_ms"
+        )
+        metrics[
+            "p99_latency_ms"
+        ] = k6_result.get(
+            "p99_ms"
+        )
+        metrics[
+            "error_rate_percent"
+        ] = k6_result.get(
+            "error_rate_percent"
+        )
+        metrics[
+            "sources"
+        ][
+            "requests_per_second"
+        ] = "k6"
+        metrics[
+            "sources"
+        ][
+            "p95_latency_ms"
+        ] = "k6"
+        metrics[
+            "sources"
+        ][
+            "p99_latency_ms"
+        ] = "k6"
+        metrics[
+            "sources"
+        ][
+            "error_rate_percent"
+        ] = "k6"
+
+    elif k6_result:
+
+        reason = k6_result.get(
+            "reason",
+            "k6 did not complete"
+        )
+
+        for metric_name in [
+            "requests_per_second",
+            "p95_latency_ms",
+            "p99_latency_ms",
+            "error_rate_percent"
+        ]:
+
+            metrics[
+                "sources"
+            ][
+                metric_name
+            ] = "k6: " + reason
+
+    try:
+
+        deployment = json.loads(
+            run_command([
+                "kubectl",
+                "get",
+                "deployment",
+                name,
+                "-n",
+                namespace,
+                "-o",
+                "json"
+            ])
+        )
+
+        metrics[
+            "available_replicas"
+        ] = deployment.get(
+            "status",
+            {}
+        ).get(
+            "availableReplicas",
+            0
+        ) or 0
+
+    except (
+        RuntimeError,
+        json.JSONDecodeError
+    ):
+
+        pass
+
+    if metrics[
+        "cpu_avg"
+    ] is None:
+
+        try:
+
+            pod = get_application_pod(
+                application
+            )
+
+            if pod:
+
+                pod_name = pod.get(
+                    "metadata",
+                    {}
+                ).get(
+                    "name"
+                )
+
+                pod_uid = pod.get(
+                    "metadata",
+                    {}
+                ).get(
+                    "uid"
+                )
+                node_name = pod.get(
+                    "spec",
+                    {}
+                ).get(
+                    "nodeName"
+                )
+
+                stats = json.loads(
+                    run_command([
+                        "kubectl",
+                        "get",
+                        "--raw",
+                        f"/api/v1/nodes/{node_name}/proxy/stats/summary"
+                    ])
+                )
+
+                pod_stats = next(
+                    item for item in stats.get(
+                        "pods",
+                        []
+                    )
+                    if (
+                        item.get("podRef", {}).get("uid") == pod_uid
+                        or (
+                            item.get("podRef", {}).get("name")
+                            == pod_name
+                            and item.get("podRef", {}).get("namespace")
+                            == namespace
+                        )
+                    )
+                )
+                container_stats = pod_stats.get(
+                    "containers",
+                    []
+                )[0]
+                cpu_usage = container_stats.get(
+                    "cpu",
+                    {}
+                ).get(
+                    "usageNanoCores"
+                )
+                memory_usage = container_stats.get(
+                    "memory",
+                    {}
+                ).get(
+                    "workingSetBytes"
+                )
+
+                if cpu_usage is None:
+
+                    raise RuntimeError(
+                        "Kubelet stats did not include CPU usage."
+                    )
+
+                if memory_usage is None:
+
+                    raise RuntimeError(
+                        "Kubelet stats did not include memory usage."
+                    )
+
+                time.sleep(1)
+                metrics["cpu_avg"] = cpu_usage / 1000000000
+                metrics["cpu_max"] = metrics["cpu_avg"]
+                metrics["memory_avg"] = memory_usage
+                metrics["memory_max"] = memory_usage
+                metrics["sources"]["cpu_avg"] = "kubelet stats summary"
+                metrics["sources"]["cpu_max"] = "kubelet stats summary"
+                metrics["sources"]["memory_avg"] = "kubelet stats summary"
+                metrics["sources"]["memory_max"] = "kubelet stats summary"
+
+        except (
+            RuntimeError,
+            ValueError,
+            IndexError,
+            OSError,
+            KeyError,
+            json.JSONDecodeError
+        ):
+
+            metrics[
+                "collection_errors"
+            ].append(
+                "Kubelet CPU/memory stats unavailable."
+            )
+            metrics["sources"]["cpu_avg"] = "kubelet stats unavailable"
+            metrics["sources"]["cpu_max"] = "kubelet stats unavailable"
+            metrics["sources"]["memory_avg"] = "kubelet stats unavailable"
+            metrics["sources"]["memory_max"] = "kubelet stats unavailable"
+
+    try:
+
+        pod_data = json.loads(
+            run_command([
+                "kubectl",
+                "get",
+                "pods",
+                "-n",
+                namespace,
+                "-l",
+                f"app={get_target_app(application)}",
+                "-o",
+                "json"
+            ])
+        )
+
+        for pod in pod_data.get("items", []):
+
+            statuses = pod.get(
+                "status",
+                {}
+            ).get(
+                "containerStatuses",
+                []
+            )
+
+            for status in statuses:
+
+                metrics[
+                    "pod_restarts"
+                ] += status.get(
+                    "restartCount",
+                    0
+                )
+
+                if status.get(
+                    "lastState",
+                    {}
+                ).get(
+                    "terminated",
+                    {}
+                ).get(
+                    "reason"
+                ) == "OOMKilled":
+
+                    metrics[
+                        "oom_killed"
+                    ] = True
+
+    except (
+        RuntimeError,
+        json.JSONDecodeError
+    ):
+
+        pass
+
+    try:
+
+        top = run_command([
+            "kubectl",
+            "top",
+            "pods",
+            "-n",
+            namespace,
+            "-l",
+            f"app={get_target_app(application)}",
+            "--no-headers"
+        ])
+
+        cpu_values = []
+        memory_values = []
+
+        for line in top.splitlines():
+
+            columns = line.split()
+
+            if len(columns) < 3:
+
+                continue
+
+            cpu_values.append(
+                parse_cpu(columns[1])
+            )
+            memory_values.append(
+                parse_memory(columns[2])
+            )
+
+        cpu_values = [
+            value for value in cpu_values
+            if value is not None
+        ]
+        memory_values = [
+            value for value in memory_values
+            if value is not None
+        ]
+
+        if cpu_values:
+
+            metrics["cpu_avg"] = sum(
+                cpu_values
+            ) / len(cpu_values)
+            metrics["cpu_max"] = max(
+                cpu_values
+            )
+
+        if memory_values:
+
+            metrics["memory_avg"] = sum(
+                memory_values
+            ) / len(memory_values)
+            metrics["memory_max"] = max(
+                memory_values
+            )
+
+    except RuntimeError as error:
+
+        metrics[
+            "collection_errors"
+        ].append(
+            "kubectl top unavailable: " + str(error)
+        )
+
+    return metrics
+
+
 def scale_application(
     application,
     replicas
@@ -1597,14 +2039,23 @@ def cleanup_application(
 
     try:
 
+        replicas = application.get(
+            "replicas",
+            1
+        )
+
+        if replicas < 1:
+
+            replicas = 1
+
         scale_application(
             application,
-            0
+            replicas
         )
 
         print(
-            f"Scaled {application.get('name')} "
-            "to 0 replicas."
+            f"Restored {application.get('name')} "
+            f"to {replicas} replicas."
         )
 
     except RuntimeError as error:
@@ -1675,6 +2126,415 @@ def parse_duration(
     )
 
 
+def analyze_k6_results(
+    filename,
+    duration_metric="http_req_duration",
+    failure_metric="http_req_failed"
+):
+
+    latencies = []
+    requests = 0
+    failed_requests = 0
+
+    with open(
+        filename,
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        for line in file:
+
+            try:
+
+                data = json.loads(line)
+
+            except json.JSONDecodeError:
+
+                continue
+
+            if (
+                data.get("type") == "Point"
+                and data.get("metric") == duration_metric
+            ):
+
+                duration_value = data["data"]["value"]
+                requests += 1
+
+                if duration_value > 0:
+
+                    latencies.append(
+                        duration_value
+                    )
+
+            if (
+                data.get("type") == "Point"
+                and data.get("metric") == failure_metric
+                and data["data"]["value"] == 1
+            ):
+
+                failed_requests += 1
+
+    latencies.sort()
+
+    def percentile(
+        values,
+        percentage
+    ):
+
+        index = (
+            (len(values) - 1)
+            * percentage
+            / 100
+        )
+        lower = int(index)
+        upper = min(
+            lower + 1,
+            len(values) - 1
+        )
+        weight = index - lower
+
+        return values[lower] + (
+            values[upper] - values[lower]
+        ) * weight
+
+    return {
+        "requests": requests,
+        "failed_requests": failed_requests,
+        "error_rate_percent": (
+            failed_requests / requests * 100
+            if requests
+            else 0
+        ),
+        "p95_ms": percentile(latencies, 95)
+        if latencies
+        else None,
+        "p99_ms": percentile(latencies, 99)
+        if latencies
+        else None
+    }
+
+
+def run_k6_http(
+    application,
+    vus,
+    duration
+):
+
+    containers = application.get(
+        "containers",
+        []
+    )
+
+    ports = (
+        containers[0].get("ports", [])
+        if containers
+        else []
+    )
+
+    http_port = next(
+        (
+            port.get("containerPort")
+            for port in ports
+            if port.get("containerPort") in {80, 8080}
+        ),
+        None
+    )
+
+    if http_port is None:
+
+        return {
+            "status": "skipped",
+            "reason": "Workload does not expose an HTTP port.",
+            "source": "k6"
+        }
+
+    name = application.get(
+        "name"
+    )
+
+    namespace = application.get(
+        "namespace",
+        "default"
+    )
+
+    duration_seconds = parse_duration(
+        duration
+    )
+
+    temporary_script = None
+    output_file = None
+    port_forward = None
+
+    try:
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".js",
+            delete=False,
+            encoding="utf-8"
+        ) as script_file:
+
+            script_file.write(
+                "import http from 'k6/http';\n"
+                "export const options = { vus: "
+                + str(vus)
+                + ", duration: '"
+                + str(duration)
+                + "' };\n"
+                "export default function () { "
+                "http.get('http://127.0.0.1:18080'); }\n"
+            )
+            temporary_script = script_file.name
+
+        output_file = tempfile.NamedTemporaryFile(
+            suffix=".json",
+            delete=False
+        ).name
+
+        port_forward = subprocess.Popen([
+            "kubectl",
+            "port-forward",
+            f"deployment/{name}",
+            f"18080:{http_port}",
+            "-n",
+            namespace
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        time.sleep(2)
+
+        result = subprocess.run([
+            "k6",
+            "run",
+            "--out",
+            f"json={output_file}",
+            temporary_script
+        ], capture_output=True, text=True, timeout=duration_seconds + 30)
+
+        if result.returncode != 0:
+
+            return {
+                "status": "failed",
+                "reason": result.stderr.strip()
+                or "k6 execution failed.",
+                "source": "k6"
+            }
+
+        parsed = analyze_k6_results(
+            output_file
+        )
+        parsed[
+            "requests_per_second"
+        ] = parsed[
+            "requests"
+        ] / duration_seconds
+        parsed[
+            "status"
+        ] = "completed"
+        parsed[
+            "source"
+        ] = "k6"
+        return parsed
+
+    except (
+        OSError,
+        RuntimeError,
+        subprocess.TimeoutExpired
+    ) as error:
+
+        return {
+            "status": "failed",
+            "reason": str(error),
+            "source": "k6"
+        }
+
+    finally:
+
+        if port_forward:
+
+            port_forward.terminate()
+
+        for path in [
+            temporary_script,
+            output_file
+        ]:
+
+            if path and os.path.exists(path):
+
+                os.remove(path)
+
+
+def run_k6_grpc(
+    application,
+    vus,
+    duration
+):
+
+    grpc_workloads = {
+        "currencyservice": {
+            "port": 7000,
+            "method": "CurrencyService/Convert",
+            "request": (
+                "{from: { currencyCode: 'USD', units: 1, nanos: 0 }, "
+                "toCode: 'EUR'}"
+            )
+        },
+        "productcatalogservice": {
+            "port": 3550,
+            "method": "ProductCatalogService/ListProducts",
+            "request": "{}"
+        },
+        "adservice": {
+            "port": 9555,
+            "method": "AdService/GetAds",
+            "request": "{contextKeys: ['clothing']}"
+        },
+        "shippingservice": {
+            "port": 50051,
+            "method": "ShippingService/GetQuote",
+            "request": (
+                "{address: {streetAddress: '1 Main St', city: 'New York', "
+                "state: 'NY', country: 'US', zipCode: 10001}, items: []}"
+            )
+        }
+    }
+
+    workload = grpc_workloads.get(
+        application.get("name")
+    )
+
+    if workload is None:
+
+        return {
+            "status": "skipped",
+            "reason": "No gRPC k6 contract is configured for this workload.",
+            "source": "k6"
+        }
+
+    proto_file = os.path.join(
+        REPOSITORY_DIRECTORY,
+        "protos",
+        "demo.proto"
+    )
+
+    if not os.path.isfile(proto_file):
+
+        return {
+            "status": "skipped",
+            "reason": "The workload gRPC proto was not found.",
+            "source": "k6"
+        }
+
+    namespace = application.get(
+        "namespace",
+        "default"
+    )
+    duration_seconds = parse_duration(duration)
+    script_file = None
+    output_file = None
+    port_forward = None
+
+    try:
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".js",
+            delete=False,
+            encoding="utf-8"
+        ) as file:
+
+            file.write(
+                "import grpc from 'k6/net/grpc';\n"
+                "export const options = { vus: "
+                + str(vus)
+                + ", duration: '"
+                + str(duration)
+                + "' };\n"
+                "const client = new grpc.Client();\n"
+                "client.load(['"
+                + os.path.dirname(proto_file)
+                + "'], 'demo.proto');\n"
+                "export default function () {\n"
+                "  client.connect('127.0.0.1:17000', { plaintext: true });\n"
+                "  client.invoke('hipstershop."
+                + workload["method"]
+                + "', "
+                + workload["request"]
+                + ");\n"
+                "  client.close();\n"
+                "}\n"
+            )
+            script_file = file.name
+
+        output_file = tempfile.NamedTemporaryFile(
+            suffix=".json",
+            delete=False
+        ).name
+
+        port_forward = subprocess.Popen([
+            "kubectl",
+            "port-forward",
+            f"deployment/{application.get('name')}",
+            f"17000:{workload['port']}",
+            "-n",
+            namespace
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        time.sleep(2)
+
+        result = subprocess.run([
+            "k6",
+            "run",
+            "--out",
+            f"json={output_file}",
+            script_file
+        ], capture_output=True, text=True, timeout=duration_seconds + 30)
+
+        if result.returncode != 0:
+
+            return {
+                "status": "failed",
+                "reason": result.stderr.strip()
+                or "gRPC k6 execution failed.",
+                "source": "k6"
+            }
+
+        parsed = analyze_k6_results(
+            output_file,
+            "grpc_req_duration",
+            "grpc_req_failed"
+        )
+        parsed["requests_per_second"] = (
+            parsed["requests"] / duration_seconds
+        )
+        parsed["status"] = "completed"
+        parsed["source"] = "k6"
+        return parsed
+
+    except (
+        OSError,
+        RuntimeError,
+        subprocess.TimeoutExpired
+    ) as error:
+
+        return {
+            "status": "failed",
+            "reason": str(error),
+            "source": "k6"
+        }
+
+    finally:
+
+        if port_forward:
+
+            port_forward.terminate()
+
+        for path in [script_file, output_file]:
+
+            if path and os.path.exists(path):
+
+                os.remove(path)
+
+
 def apply_chaos_file(
     yaml_file
 ):
@@ -1715,7 +2575,8 @@ def cleanup_chaos(
                 "--all",
                 "-n",
                 namespace,
-                "--ignore-not-found"
+                "--ignore-not-found",
+                "--wait=false"
             ])
 
         except RuntimeError as error:
@@ -1872,6 +2733,8 @@ def execute_pod_kill(
         )
     )
 
+    recovery_time = time.time() - start_time
+
     cleanup_chaos(
         namespace,
         [
@@ -1884,6 +2747,7 @@ def execute_pod_kill(
         "start_time": start_time,
         "end_time": time.time(),
         "recovered": recovered,
+        "recovery_time_seconds": recovery_time,
         "status": (
             "completed"
             if recovered
@@ -1895,7 +2759,8 @@ def execute_pod_kill(
 def execute_five_chaos(
     application,
     yaml_file,
-    duration
+    duration,
+    vus
 ):
 
     namespace = application.get(
@@ -1946,6 +2811,29 @@ def execute_five_chaos(
         yaml_file
     )
 
+    if application.get(
+        "name"
+    ) in {
+        "currencyservice",
+        "productcatalogservice",
+        "adservice",
+        "shippingservice"
+    }:
+
+        k6_result = run_k6_grpc(
+            application,
+            vus,
+            duration
+        )
+
+    else:
+
+        k6_result = run_k6_http(
+            application,
+            vus,
+            duration
+        )
+
     seconds = parse_duration(
         duration
     )
@@ -1977,6 +2865,8 @@ def execute_five_chaos(
         )
     )
 
+    recovery_time = time.time() - start_time
+
     return {
         "environments": FIVE_CHAOS_ENVIRONMENTS,
         "start_time": start_time,
@@ -1984,6 +2874,8 @@ def execute_five_chaos(
         "duration": duration,
         "simultaneous": True,
         "recovered": recovered,
+        "recovery_time_seconds": recovery_time,
+        "k6": k6_result,
         "status": "completed"
     }
 
@@ -2072,6 +2964,8 @@ def execute_node_failure(
         )
     )
 
+    recovery_time = time.time() - start_time
+
     return {
         "environment": "Node Failure",
         "node": node_name,
@@ -2079,6 +2973,7 @@ def execute_node_failure(
         "end_time": time.time(),
         "duration": duration,
         "recovered": recovered,
+        "recovery_time_seconds": recovery_time,
         "status": (
             "completed"
             if recovered
@@ -2313,7 +3208,8 @@ def process_application(
             execute_five_chaos(
                 application,
                 five_chaos_file,
-                duration
+                duration,
+                vus
             )
         )
 
@@ -2371,6 +3267,16 @@ def process_application(
         ][
             "node_failure"
         ] = node_failure_result
+
+        result[
+            "metrics"
+        ] = collect_result_metrics(
+            application,
+            pod_kill_result,
+            five_chaos_result.get(
+                "k6"
+            )
+        )
 
         result[
             "chaos"
@@ -2582,7 +3488,11 @@ def generate_environment():
             results.append({
                 "application": application,
                 "status": "failed",
-                "error": str(error)
+                "error": str(error),
+                "metrics": collect_result_metrics(
+                    application,
+                    None
+                )
             })
 
     aggregate_file = os.path.join(
