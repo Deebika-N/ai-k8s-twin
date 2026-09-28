@@ -1,0 +1,17 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NodeChaos
+
+metadata:
+  name: {{ chaos_name }}
+  namespace: {{ namespace }}
+
+spec:
+  action: node-failure
+
+  mode: one
+
+  selector:
+    nodes:
+      - {{ node_name }}
+
+  duration: "{{ duration }}"

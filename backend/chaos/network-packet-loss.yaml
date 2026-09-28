@@ -1,0 +1,24 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+
+metadata:
+  name: {{ chaos_name }}
+  namespace: {{ namespace }}
+
+spec:
+  action: loss
+
+  mode: {{ mode }}
+
+  selector:
+    namespaces:
+      - {{ namespace }}
+
+    labelSelectors:
+      app: {{ target_app }}
+
+  loss:
+    loss: "{{ loss_percent }}"
+    correlation: "{{ correlation }}"
+
+  duration: "{{ duration }}"

@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+gitpython
+pyyaml
+groq
+requests
+jinja2
