@@ -12,71 +12,93 @@ ALLOWED_ENVIRONMENTS = {
 }
 
 
-def parse_cpu(value):
-
-    value = str(value).strip()
-
-    if value.endswith("m"):
-
-        try:
-            return float(
-                value[:-1]
-            ) / 1000
-
-        except ValueError:
-            return None
-
-    try:
-        return float(value)
-
-    except ValueError:
-        return None
-
-
 def parse_memory(value):
+
+    if value is None:
+        return None
 
     value = str(value).strip()
 
     units = {
+        "Ki": 1024 ** 1,
+        "Mi": 1024 ** 2,
+        "Gi": 1024 ** 3,
         "K": 1000,
         "M": 1000 ** 2,
-        "G": 1000 ** 3,
-        "Ki": 1024,
-        "Mi": 1024 ** 2,
-        "Gi": 1024 ** 3
+        "G": 1000 ** 3
     }
 
-    for unit, multiplier in units.items():
+    for unit in sorted(
+        units,
+        key=len,
+        reverse=True
+    ):
 
         if value.endswith(unit):
+
+            number = value[:-len(unit)]
 
             try:
 
                 return (
-                    float(
-                        value[:-len(unit)]
-                    )
-                    * multiplier
+                    float(number)
+                    * units[unit]
                 )
 
             except ValueError:
 
                 return None
 
-    return None
+    try:
+
+        return float(value)
+
+    except ValueError:
+
+        return None
+
+
+def parse_cpu(value):
+
+    if value is None:
+        return None
+
+    value = str(value).strip()
+
+    if value.endswith("m"):
+
+        try:
+
+            return (
+                float(value[:-1])
+                / 1000
+            )
+
+        except ValueError:
+
+            return None
+
+    try:
+
+        return float(value)
+
+    except ValueError:
+
+        return None
+
+
 def validate_environment_parameters(
     result,
     application
 ):
 
-    # --------------------------------
-    # Basic structure
-    # --------------------------------
-
-    if not isinstance(result, dict):
+    if not isinstance(
+        result,
+        dict
+    ):
 
         return False, (
-            "Result must be a JSON object."
+            "LLM result must be a dictionary."
         )
 
     environments = result.get(
@@ -89,12 +111,8 @@ def validate_environment_parameters(
     ):
 
         return False, (
-            "Environments must be a JSON object."
+            "Missing environments object."
         )
-
-    # --------------------------------
-    # Get application limits
-    # --------------------------------
 
     containers = application.get(
         "containers",
@@ -110,14 +128,26 @@ def validate_environment_parameters(
     container = containers[0]
 
     resources = container.get(
-        "resources",
-        {}
+        "resources"
     )
 
+    if not isinstance(
+        resources,
+        dict
+    ):
+
+        resources = {}
+
     limits = resources.get(
-        "limits",
-        {}
+        "limits"
     )
+
+    if not isinstance(
+        limits,
+        dict
+    ):
+
+        limits = {}
 
     cpu_limit = limits.get(
         "cpu"
@@ -127,20 +157,13 @@ def validate_environment_parameters(
         "memory"
     )
 
-    # --------------------------------
-    # Validate each environment
-    # --------------------------------
-
     for environment, parameters in environments.items():
-
-        # --------------------------------
-        # Environment name
-        # --------------------------------
 
         if environment not in ALLOWED_ENVIRONMENTS:
 
             return False, (
-                f"Invalid environment: {environment}"
+                f"Unsupported environment: "
+                f"{environment}"
             )
 
         if not isinstance(
@@ -149,101 +172,106 @@ def validate_environment_parameters(
         ):
 
             return False, (
-                f"Parameters for {environment} "
-                "must be an object."
+                f"Parameters for "
+                f"{environment} must be "
+                f"an object."
             )
 
-        # --------------------------------
-        # CPU Stress
-        # --------------------------------
+        value = parameters.get(
+            "value"
+        )
+
+        if value is None:
+
+            return False, (
+                f"Missing value for "
+                f"{environment}."
+            )
 
         if environment == "CPU Stress":
 
-            value = parameters.get("value")
-
-            if value is None:
-                return False, "CPU Stress requires value."
-
             try:
 
-                stress_load = float(
-                    str(value).strip()
-                )
+                cpu_value = float(value)
 
-            except ValueError:
-
-                return False, "Invalid CPU stress value."
-
-            if stress_load <= 0 or stress_load > 100:
+            except (
+                ValueError,
+                TypeError
+            ):
 
                 return False, (
-                    "CPU stress load must be between "
-                    "1 and 100 percent."
+                    "CPU Stress value "
+                    "must be numeric."
                 )
 
-        # --------------------------------
-        # Memory Stress
-        # --------------------------------
+            if (
+                cpu_value <= 0
+                or cpu_value > 100
+            ):
+
+                return False, (
+                    "CPU Stress must be "
+                    "between 1 and 100."
+                )
+
+            if cpu_limit is not None:
+
+                cpu_limit_value = parse_cpu(
+                    cpu_limit
+                )
+
+                if cpu_limit_value is None:
+
+                    return False, (
+                        "Application CPU "
+                        "limit is invalid."
+                    )
 
         elif environment == "Memory Stress":
 
-            value = parameters.get(
-                "value"
-            )
-
-            if value is None:
-
-                return False, (
-                    "Memory Stress requires value."
-                )
-
-            stress_memory = parse_memory(
+            memory_value = parse_memory(
                 value
             )
 
-            limit_memory = parse_memory(
-                memory_limit
-            )
-
-            if stress_memory is None:
+            if memory_value is None:
 
                 return False, (
-                    "Invalid memory stress value."
+                    "Memory Stress value "
+                    "is invalid."
                 )
 
-            if limit_memory is None:
+            if memory_value <= 0:
 
                 return False, (
-                    "Application memory limit is invalid."
+                    "Memory Stress must be "
+                    "greater than zero."
                 )
 
-            if stress_memory <= 0:
+            if memory_limit is not None:
 
-                return False, (
-                    "Memory stress must be greater than zero."
+                memory_limit_value = parse_memory(
+                    memory_limit
                 )
 
-            if stress_memory > limit_memory:
+                if memory_limit_value is None:
 
-                return False, (
-                    "Memory stress exceeds application memory limit."
-                )
+                    return False, (
+                        "Application memory "
+                        "limit is invalid."
+                    )
 
-        # --------------------------------
-        # Network Delay
-        # --------------------------------
+                if (
+                    memory_value
+                    > memory_limit_value
+                ):
+
+                    return False, (
+                        "Memory Stress value "
+                        "exceeds application "
+                        "memory limit."
+                    )
 
         elif environment == "Network Delay":
-
-            value = parameters.get(
-                "value"
-            )
-
-            if value is None:
-
-                return False, (
-                    "Network Delay requires value."
-                )
 
             match = re.fullmatch(
                 r"(\d+)(ms|s)",
@@ -253,10 +281,11 @@ def validate_environment_parameters(
             if not match:
 
                 return False, (
-                    "Network delay must use ms or s."
+                    "Network Delay must "
+                    "use ms or s."
                 )
 
-            delay = int(
+            delay_value = int(
                 match.group(1)
             )
 
@@ -264,58 +293,54 @@ def validate_environment_parameters(
 
             if unit == "s":
 
-                delay = delay * 1000
-
-            if delay <= 0:
-
-                return False, (
-                    "Network delay must be greater than zero."
+                delay_ms = (
+                    delay_value * 1000
                 )
 
-            if delay > 10000:
+            else:
+
+                delay_ms = delay_value
+
+            if delay_ms <= 0:
 
                 return False, (
-                    "Network delay cannot exceed 10 seconds."
+                    "Network Delay must be "
+                    "greater than zero."
                 )
 
-        # --------------------------------
-        # Network Loss
-        # --------------------------------
+            if delay_ms > 10000:
+
+                return False, (
+                    "Network Delay cannot "
+                    "exceed 10 seconds."
+                )
 
         elif environment == "Network Loss":
 
-            value = parameters.get(
-                "value"
-            )
-
-            if value is None:
-
-                return False, (
-                    "Network Loss requires value."
-                )
-
             try:
 
-                loss = float(
-                    str(value).strip()
-                )
+                loss_value = float(value)
 
-            except ValueError:
-
-                return False, (
-                    "Invalid network loss value."
-                )
-
-            if loss <= 0 or loss > 100:
+            except (
+                ValueError,
+                TypeError
+            ):
 
                 return False, (
-                    "Network loss must be between "
-                    "0 and 100 percent."
+                    "Network Loss must "
+                    "be numeric."
                 )
 
-        # --------------------------------
-        # Pod Kill
-        # --------------------------------
+            if (
+                loss_value <= 0
+                or loss_value > 100
+            ):
+
+                return False, (
+                    "Network Loss must be "
+                    "greater than 0 and "
+                    "at most 100."
+                )
 
         elif environment == "Pod Kill":
 
@@ -326,12 +351,9 @@ def validate_environment_parameters(
             if not target:
 
                 return False, (
-                    "Pod Kill requires a target."
+                    "Pod Kill requires "
+                    "a target."
                 )
-
-        # --------------------------------
-        # Network Partition
-        # --------------------------------
 
         elif environment == "Network Partition":
 
@@ -342,12 +364,9 @@ def validate_environment_parameters(
             if not target:
 
                 return False, (
-                    "Network Partition requires a target."
+                    "Network Partition "
+                    "requires a target."
                 )
-
-        # --------------------------------
-        # Node Failure
-        # --------------------------------
 
         elif environment == "Node Failure":
 
@@ -358,9 +377,10 @@ def validate_environment_parameters(
             if not node:
 
                 return False, (
-                    "Node Failure requires a node."
+                    "Node Failure requires "
+                    "a node."
                 )
 
     return True, (
-        "All environment parameters are valid."
+        "Environment parameters are valid."
     )

@@ -1,32 +1,37 @@
+import os
 import shutil
-import tempfile
 
 from git import Repo
 
 
+REPOSITORY_DIRECTORY = os.path.expanduser(
+    "~/ai-k8s-twin/temp_repository"
+)
+
+
 def clone_repository(github_url: str) -> str:
-    """
-    Clone a GitHub repository into a temporary directory.
 
-    Returns:
-        Path to the cloned repository.
-    """
+    if os.path.exists(REPOSITORY_DIRECTORY):
 
-    temp_dir = tempfile.mkdtemp(
-        prefix="ai_k8s_twin_"
-    )
-
-    try:
-        Repo.clone_from(
-            github_url,
-            temp_dir
+        print(
+            "Repository already exists. Reusing it."
         )
 
-        return temp_dir
+        return REPOSITORY_DIRECTORY
+
+    try:
+
+        Repo.clone_from(
+            github_url,
+            REPOSITORY_DIRECTORY
+        )
+
+        return REPOSITORY_DIRECTORY
 
     except Exception:
+
         shutil.rmtree(
-            temp_dir,
+            REPOSITORY_DIRECTORY,
             ignore_errors=True
         )
 
