@@ -100,3 +100,48 @@ The backend currently implements the environment simulation and workload generat
   - P95/P99 latency
   - Chaos environments
   - Prometheus observations
+
+## Iterative configuration optimization
+
+
+The script runs the Groq environment generator and then creates
+`environment-generator\generated\deployment.yaml`. Set `GROQ_API_KEY` before
+running it. The virtual environment avoids reinstalling Python packages; Docker
+Desktop, `kubectl`, Kind, Helm, Chaos Mesh, Prometheus, and k6 are still
+separate machine or cluster prerequisites.
+
+The bounded optimization controller is available from the repository root:
+
+```bash
+python backend/optimization_cli.py \
+  --repository-url https://github.com/example/project.git \
+  --available-cpu 4 \
+  --available-memory 8Gi \
+  --vus 10 \
+  --duration 60s \
+  --max-iterations 5
+```
+
+The command requires `kubectl`, Chaos Mesh, k6, a Prometheus port-forward, and
+`GROQ_API_KEY`. It stores each run below `backend/results/<run_id>/` and stops
+when the deterministic constraints pass, a candidate repeats, or the maximum
+iteration count is reached.
+
+Optional requirements can be supplied as JSON:
+
+```json
+{
+  "max_p95_latency_ms": 200,
+  "max_error_rate_percent": 1,
+  "max_recovery_time_seconds": 30,
+  "max_oom_killed": 0
+}
+```
+
+```bash
+python backend/optimization_cli.py \
+  --repository-url https://github.com/example/project.git \
+  --available-cpu 4 \
+  --available-memory 8Gi \
+  --requirements-json requirements.json
+```

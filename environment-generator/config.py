@@ -1,4 +1,4 @@
-"""Validated configuration model for the paymentservice experiment target."""
+"""Validated configuration model for the generated paymentservice environment."""
 
 from dataclasses import dataclass
 import re
