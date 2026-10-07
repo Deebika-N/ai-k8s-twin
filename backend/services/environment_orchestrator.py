@@ -1644,6 +1644,11 @@ def collect_result_metrics(
         "pod_restarts": None,
         "available_replicas": None,
         "oom_killed": None,
+        "pod_kill_recovered": (
+            recovery_result.get("recovered")
+            if recovery_result and recovery_result.get("environment") == "Pod Kill"
+            else None
+        ),
         "pod_kill_recovery_seconds": (
             recovery_result.get("pod_kill_recovery_seconds")
             if recovery_result
@@ -1712,6 +1717,7 @@ def collect_result_metrics(
             "pod_restarts": "kubectl pod status",
             "available_replicas": "kubectl deployment status",
             "oom_killed": "kubectl pod status",
+            "pod_kill_recovered": "Pod Kill recovery event observation",
             "pod_kill_recovery_seconds": "Pod Kill replacement readiness timer",
             "chaos_apply_seconds": "Pod Kill kubectl apply interval",
             "pod_disappearance_seconds": "Pod Kill target disappearance interval",
@@ -1956,9 +1962,13 @@ def collect_result_metrics(
         pod_items = pod_data.get("items", [])
         metrics["pod_restarts"] = 0
         metrics["oom_killed"] = False
+        candidate_containers = {
+            container.get("name"): container
+            for container in application.get("containers", [])
+        }
+        candidate_container_observed = False
 
         for pod in pod_items:
-
             statuses = pod.get(
                 "status",
                 {}
@@ -1966,8 +1976,21 @@ def collect_result_metrics(
                 "containerStatuses",
                 []
             )
+            pod_containers = {
+                container.get("name"): container
+                for container in pod.get("spec", {}).get("containers", [])
+            }
 
             for status in statuses:
+                candidate_container = candidate_containers.get(status.get("name"))
+                pod_container = pod_containers.get(status.get("name"))
+                if (
+                    candidate_container is None
+                    or pod_container is None
+                    or not pod_container_matches_candidate(pod_container, candidate_container)
+                ):
+                    continue
+                candidate_container_observed = True
 
                 metrics[
                     "pod_restarts"
@@ -1976,21 +1999,13 @@ def collect_result_metrics(
                     0
                 )
 
-                if status.get(
-                    "lastState",
-                    {}
-                ).get(
-                    "terminated",
-                    {}
-                ).get(
-                    "reason"
-                ) == "OOMKilled":
+                if container_was_oom_killed(status):
 
                     metrics[
                         "oom_killed"
                     ] = True
 
-        if not pod_items:
+        if not candidate_container_observed:
             metrics["pod_restarts"] = None
             metrics["oom_killed"] = None
 
@@ -2068,6 +2083,43 @@ def collect_result_metrics(
         )
 
     return metrics
+
+
+def container_was_oom_killed(container_status):
+    """Check both a current termination and the most recent container termination."""
+    current_state = container_status.get("state") or {}
+    last_state = container_status.get("lastState") or {}
+    return any(
+        state.get("reason") == "OOMKilled"
+        for state in (
+            current_state.get("terminated", {}),
+            last_state.get("terminated", {}),
+        )
+    )
+
+
+def pod_container_matches_candidate(pod_container, candidate_container):
+    """Ignore stale ReplicaSet pods whose resource settings differ from this run."""
+    if pod_container.get("name") != candidate_container.get("name"):
+        return False
+    expected = candidate_container.get("resources", {})
+    if not expected:
+        return True
+    actual = pod_container.get("resources", {})
+    from services.optimization_policy import cpu_millicores, memory_bytes
+
+    parsers = {"cpu": cpu_millicores, "memory": memory_bytes}
+    for group in ("requests", "limits"):
+        expected_group = expected.get(group, {})
+        actual_group = actual.get(group, {})
+        for resource in ("cpu", "memory"):
+            if resource in expected_group:
+                try:
+                    if parsers[resource](actual_group.get(resource)) != parsers[resource](expected_group[resource]):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+    return True
 
 
 def scale_application(
@@ -2773,16 +2825,34 @@ def wait_for_pod_kill_recovery(
     application,
     killed_pod,
     timeout=120,
+    pre_chaos_pods=None,
 ):
-    """Wait for the killed pod to disappear and its replacement to be Ready."""
+    """Observe a post-Chaos pod replacement or container restart becoming Ready."""
     namespace = application.get("namespace", "default")
     target_app = get_target_app(application)
-    killed_metadata = killed_pod.get("metadata", {})
-    killed_name = killed_metadata.get("name")
-    killed_uid = killed_metadata.get("uid")
     expected_replicas = int(application.get("replicas", 1))
+    original_pods = pre_chaos_pods or [killed_pod]
+
+    def pod_identity(pod):
+        metadata = pod.get("metadata", {})
+        return metadata.get("uid") or metadata.get("name")
+
+    original_pods_by_id = {pod_identity(pod): pod for pod in original_pods}
+    original_pod_ids = set(original_pods_by_id)
     deadline = time.time() + timeout
     pod_disappeared_at = None
+    container_restart_detected_at = {}
+    replacement_pod_observed_at = None
+    detected_killed_pod = killed_pod.get("metadata", {}).get("name")
+
+    def pod_is_ready(pod):
+        status = pod.get("status", {})
+        container_statuses = status.get("containerStatuses", [])
+        return (
+            status.get("phase") == "Running"
+            and bool(container_statuses)
+            and all(container.get("ready", False) for container in container_statuses)
+        )
 
     while time.time() < deadline:
         try:
@@ -2791,37 +2861,94 @@ def wait_for_pod_kill_recovery(
                 "-l", f"app={target_app}", "-o", "json",
             ]))
             pods = data.get("items", [])
-            killed_present = any(
-                pod.get("metadata", {}).get("uid") == killed_uid
-                or (
-                    killed_uid is None
-                    and pod.get("metadata", {}).get("name") == killed_name
-                )
-                for pod in pods
-            )
-            if not killed_present and pod_disappeared_at is None:
+            current_pods_by_id = {pod_identity(pod): pod for pod in pods}
+            missing_originals = [
+                original_pods_by_id[pod_id]
+                for pod_id in original_pod_ids
+                if pod_id not in current_pods_by_id
+            ]
+            if missing_originals and pod_disappeared_at is None:
                 pod_disappeared_at = time.time()
+                detected_killed_pod = missing_originals[0].get("metadata", {}).get("name")
+
+            deleting_originals = [
+                pod for pod_id, pod in current_pods_by_id.items()
+                if pod_id in original_pod_ids and (
+                    pod.get("metadata", {}).get("deletionTimestamp")
+                    or pod.get("status", {}).get("phase") in {"Succeeded", "Failed"}
+                )
+            ]
+            if deleting_originals:
+                detected_killed_pod = deleting_originals[0].get("metadata", {}).get("name")
 
             ready_pods = [
                 pod for pod in pods
-                if pod.get("status", {}).get("phase") == "Running"
-                and any(status.get("ready", False) for status in pod.get("status", {}).get("containerStatuses", []))
+                if pod_is_ready(pod)
             ]
-            replacement_ready = any(
-                pod.get("metadata", {}).get("uid") != killed_uid
-                and pod.get("metadata", {}).get("name") != killed_name
-                for pod in ready_pods
-            ) or any(
-                pod.get("metadata", {}).get("uid") != killed_uid
-                for pod in ready_pods
-            )
-            if pod_disappeared_at is not None and replacement_ready and len(ready_pods) >= expected_replicas:
+            replacement_pods = [
+                pod for pod in pods
+                if pod_identity(pod) not in original_pod_ids
+            ]
+            if replacement_pods and replacement_pod_observed_at is None:
+                replacement_pod_observed_at = time.time()
+            for original_id, original_pod in original_pods_by_id.items():
+                same_pod = current_pods_by_id.get(original_id)
+                if same_pod is None:
+                    continue
+                original_restart_counts = {
+                    status.get("name"): status.get("restartCount", 0)
+                    for status in original_pod.get("status", {}).get("containerStatuses", [])
+                }
+                current_restart_counts = {
+                    status.get("name"): status.get("restartCount", 0)
+                    for status in same_pod.get("status", {}).get("containerStatuses", [])
+                }
+                restart_observed = any(
+                    current_restart_counts.get(name, 0) > restart_count
+                    for name, restart_count in original_restart_counts.items()
+                )
+                if restart_observed and original_id not in container_restart_detected_at:
+                    container_restart_detected_at[original_id] = time.time()
+                    detected_killed_pod = same_pod.get("metadata", {}).get("name")
+                if (
+                    restart_observed
+                    and pod_is_ready(same_pod)
+                    and len(ready_pods) >= expected_replicas
+                ):
+                    ready_at = time.time()
+                    return {
+                        "recovered": True,
+                        "killed_pod": same_pod.get("metadata", {}).get("name"),
+                        "replacement_ready_replicas": len(ready_pods),
+                        "pod_disappeared_at": None,
+                        "recovery_event_at": container_restart_detected_at[original_id],
+                        "replacement_pod_ready_at": ready_at,
+                        "recovery_mode": "container_restart",
+                        "poll_interval_seconds": 3,
+                    }
+
+            replacement_ready_pods = [
+                pod for pod in replacement_pods
+                if pod_is_ready(pod)
+            ]
+            if (
+                (missing_originals or deleting_originals)
+                and replacement_ready_pods
+                and len(ready_pods) >= expected_replicas
+            ):
+                ready_at = time.time()
                 return {
                     "recovered": True,
-                    "killed_pod": killed_name,
+                    "killed_pod": detected_killed_pod,
                     "replacement_ready_replicas": len(ready_pods),
                     "pod_disappeared_at": pod_disappeared_at,
-                    "replacement_pod_ready_at": time.time(),
+                    "recovery_event_at": (
+                        pod_disappeared_at
+                        if pod_disappeared_at is not None
+                        else replacement_pod_observed_at
+                    ),
+                    "replacement_pod_ready_at": ready_at,
+                    "recovery_mode": "pod_replacement",
                     "poll_interval_seconds": 3,
                 }
         except (RuntimeError, json.JSONDecodeError):
@@ -2830,9 +2957,16 @@ def wait_for_pod_kill_recovery(
 
     return {
         "recovered": False,
-        "killed_pod": killed_name,
+        "killed_pod": detected_killed_pod,
         "replacement_ready_replicas": None,
         "pod_disappeared_at": pod_disappeared_at,
+        "recovery_event_at": (
+            next(iter(container_restart_detected_at.values()), None)
+            if container_restart_detected_at
+            else replacement_pod_observed_at
+            if replacement_pod_observed_at is not None
+            else pod_disappeared_at
+        ),
         "replacement_pod_ready_at": None,
         "poll_interval_seconds": 3,
         "reason": "POD_REPLACEMENT_NOT_READY",
@@ -2881,7 +3015,11 @@ def execute_pod_kill(
         "\nPod Kill is active."
     )
 
-    recovery = wait_for_pod_kill_recovery(application, killed_pod)
+    recovery = wait_for_pod_kill_recovery(
+        application,
+        killed_pod,
+        pre_chaos_pods=pods,
+    )
 
     recovery_time = time.time() - start_time
     pod_disappearance_seconds = (
@@ -2889,9 +3027,10 @@ def execute_pod_kill(
         if recovery.get("pod_disappeared_at") is not None
         else None
     )
+    recovery_event_at = recovery.get("recovery_event_at") or recovery.get("pod_disappeared_at")
     replacement_pod_ready_seconds = (
-        recovery["replacement_pod_ready_at"] - recovery["pod_disappeared_at"]
-        if recovery.get("replacement_pod_ready_at") is not None and recovery.get("pod_disappeared_at") is not None
+        recovery["replacement_pod_ready_at"] - recovery_event_at
+        if recovery.get("replacement_pod_ready_at") is not None and recovery_event_at is not None
         else None
     )
     print(f"[pod-kill] pod_disappearance_seconds={pod_disappearance_seconds}")
@@ -2910,7 +3049,7 @@ def execute_pod_kill(
         "start_time": start_time,
         "end_time": time.time(),
         "recovered": recovery["recovered"],
-        "pod_kill_recovery_seconds": recovery_time,
+        "pod_kill_recovery_seconds": recovery_time if recovery["recovered"] else None,
         "chaos_apply_seconds": chaos_apply_seconds,
         "pod_disappearance_seconds": pod_disappearance_seconds,
         "replacement_pod_ready_seconds": replacement_pod_ready_seconds,

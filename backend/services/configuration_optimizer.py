@@ -42,21 +42,74 @@ class GroqConfigurationProposalClient:
         features: Mapping[str, Any],
         constraints: Mapping[str, Any],
         history: list[Mapping[str, Any]],
+        constraint_evaluation: Mapping[str, Any],
+        failed_constraints: list[Mapping[str, Any]],
+        resource_score: float,
+        bounds: Mapping[str, Any],
+        proposal_goal: str = "ADDRESS_FAILED_CONSTRAINTS",
     ) -> dict[str, Any]:
         payload = {
             "current_configuration": dict(current_configuration),
             "experiment_result": dict(result),
             "features": dict(features),
             "constraints": dict(constraints),
+            "constraint_evaluation": dict(constraint_evaluation),
+            "failed_constraints": [dict(item) for item in failed_constraints],
+            "resource_score": resource_score,
+            "optimization_bounds": dict(bounds),
             "optimization_history": [dict(item) for item in history],
+            "proposal_goal": proposal_goal,
         }
         prompt = (
-            "Return JSON only. Propose exactly one bounded Kubernetes resource configuration. "
-            "Change only replicas, cpu_request, cpu_limit, memory_request, and memory_limit. "
-            "Never return image, ports, probes, namespaces, services, commands, YAML, or kubectl. "
-            "Use only the supplied experiment data.\n\n"
+            "You are optimizing a Kubernetes deployment configuration.\n\n"
+            "Optimize ONLY these five parameters:\n"
+            "- replicas\n"
+            "- cpu_request\n"
+            "- cpu_limit\n"
+            "- memory_request\n"
+            "- memory_limit\n\n"
+
+            "The objective is to find the LOWEST-RESOURCE configuration "
+            "that satisfies ALL defined constraints.\n\n"
+
+            "You are given the current configuration, current experiment "
+            "results, constraint evaluation, and the complete optimization history.\n\n"
+
+            "When proposal_goal is MINIMIZE_RESOURCES, all hard constraints already pass. "
+            "Explicitly propose a configuration with a strictly lower resource score "
+            "than the current configuration, staying within optimization_bounds. "
+            "Do not change a passing candidate to address a constraint that is already passing.\n"
+            "When proposal_goal is ADDRESS_FAILED_CONSTRAINTS, propose a bounded configuration "
+            "that addresses the listed failed constraints while preserving checks that pass.\n\n"
+            "Use the complete history to:\n"
+            "- understand what configurations were already tested;\n"
+            "- never repeat a previously tested configuration;\n"
+            "- identify which constraints are still failing;\n"
+            "- avoid increasing resources when already-passing constraints "
+            "do not require improvement;\n"
+            "- target the remaining failed constraints;\n"
+            "- preserve constraints that already pass;\n"
+            "- avoid increasing resources unless prior experiment evidence supports "
+            "improvement in a currently failed constraint;\n"
+            "- prefer lower-resource configurations when constraints are satisfied.\n\n"
+
+            "Do not assume that increasing resources always improves every metric. "
+            "Use the experimental results from previous iterations as evidence.\n\n"
+
+            "Only propose the five allowed resource fields. "
+            "All other Kubernetes properties are immutable and controlled by the backend.\n"
+
+            "Do not generate Kubernetes YAML or kubectl commands.\n"
+            "Return only valid JSON using the required top-level "
+            "proposed_configuration schema; place the allowed resource fields "
+            "inside proposed_configuration.\n"
+
             + json.dumps(payload, indent=2)
-            + '\n\nRequired schema: {"proposed_configuration": {}, "reasoning_summary": "", "targeted_problem": [], "expected_effect": []}'
+            + '\n\nRequired schema: '
+            '{"proposed_configuration": {}, '
+            '"reasoning_summary": "", '
+            '"targeted_problem": [], '
+            '"expected_effect": []}'
         )
         response = self.client.chat.completions.create(
             model=self.model,

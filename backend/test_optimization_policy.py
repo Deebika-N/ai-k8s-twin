@@ -43,6 +43,40 @@ class OptimizationPolicyTests(unittest.TestCase):
         self.assertEqual(features["pod_kill_recovery_seconds"], 12)
         self.assertEqual(features["max_recovery_time_seconds"], 12)
 
+    def test_recovery_constraint_ignores_generic_stress_recovery(self):
+        result = {
+            "experiments": [
+                {"name": "pod_kill", "metrics": {"pod_kill_recovery_seconds": 32}},
+                {"name": "cpu_stress", "metrics": {"recovery_time_seconds": 1}},
+            ],
+        }
+        features = extract_features(result)
+        evaluation = evaluate_constraints(features, OptimizationConstraints())
+        recovery_check = next(
+            check for check in evaluation["checks"]
+            if check["name"] == "pod_kill_recovery_seconds"
+        )
+        self.assertEqual(recovery_check["measured"], 32)
+        self.assertEqual(recovery_check["status"], "FAIL")
+
+    def test_unobserved_pod_kill_timeout_is_a_failure_not_a_120_second_measurement(self):
+        result = {
+            "experiments": [{"name": "pod_kill", "metrics": {
+                "pod_kill_recovered": False,
+                "pod_kill_recovery_seconds": None,
+                "total_recovery_seconds": 120,
+            }}],
+        }
+        features = extract_features(result)
+        evaluation = evaluate_constraints(features, OptimizationConstraints())
+        recovery_check = next(
+            check for check in evaluation["checks"]
+            if check["name"] == "pod_kill_recovery_seconds"
+        )
+        self.assertEqual(recovery_check["status"], "FAIL")
+        self.assertIsNone(recovery_check["measured"])
+        self.assertEqual(recovery_check["reason"], "recovery_not_observed_before_timeout")
+
     def test_constraint_evaluation_is_deterministic(self):
         evaluation = evaluate_constraints(
             {"max_p95_latency_ms": 300, "max_p99_latency_ms": None, "max_error_rate_percent": 0, "pod_kill_recovery_seconds": 5, "min_available_replicas": 2, "oom_killed": False},
@@ -58,6 +92,21 @@ class OptimizationPolicyTests(unittest.TestCase):
     def test_bounds_and_request_limit_are_enforced(self):
         with self.assertRaises(ConfigurationValidationError):
             validate_candidate({**CONFIGURATION, "cpu_request": "1500m", "cpu_limit": "1000m"}, ResourceBounds())
+
+    def test_below_minimum_resources_are_allowed_only_when_requested(self):
+        existing = {
+            "replicas": 1,
+            "cpu_request": "50m",
+            "cpu_limit": "100m",
+            "memory_request": "64Mi",
+            "memory_limit": "128Mi",
+        }
+        self.assertEqual(
+            validate_candidate(existing, ResourceBounds(), allow_below_minimum_resources=True),
+            existing,
+        )
+        with self.assertRaises(ConfigurationValidationError):
+            validate_candidate(existing, ResourceBounds())
 
     def test_groq_parser_ignores_extra_top_level_fields(self):
         candidate = parse_proposal(

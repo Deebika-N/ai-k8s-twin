@@ -35,6 +35,16 @@ class ResourceBounds:
 
 
 @dataclass(frozen=True)
+class ResourceSearchFloors:
+    """Lower test limits, set to half the smallest checked-in workload resources."""
+    min_replicas: int = 1
+    min_cpu_request_m: float = 50
+    min_cpu_limit_m: float = 100
+    min_memory_request_bytes: float = 32 * 1024**2
+    min_memory_limit_bytes: float = 64 * 1024**2
+
+
+@dataclass(frozen=True)
 class OptimizationConstraints:
     max_p95_latency_ms: float | None = 200.0
     max_p99_latency_ms: float | None = None
@@ -69,6 +79,8 @@ def validate_candidate(
     bounds: ResourceBounds,
     available_cpu: Any | None = None,
     available_memory: Any | None = None,
+    *,
+    allow_below_minimum_resources: bool = False,
 ) -> dict[str, Any]:
     required = {"replicas", "cpu_request", "cpu_limit", "memory_request", "memory_limit"}
     missing = required - set(configuration)
@@ -81,13 +93,21 @@ def validate_candidate(
     cpu_limit = cpu_millicores(configuration["cpu_limit"])
     memory_request = memory_bytes(configuration["memory_request"])
     memory_limit = memory_bytes(configuration["memory_limit"])
-    if not bounds.min_cpu_request_m <= cpu_request <= bounds.max_cpu_request_m:
+    if cpu_request > bounds.max_cpu_request_m or (
+        not allow_below_minimum_resources and cpu_request < bounds.min_cpu_request_m
+    ):
         raise ConfigurationValidationError("CPU request is outside configured bounds")
-    if not bounds.min_cpu_limit_m <= cpu_limit <= bounds.max_cpu_limit_m:
+    if cpu_limit > bounds.max_cpu_limit_m or (
+        not allow_below_minimum_resources and cpu_limit < bounds.min_cpu_limit_m
+    ):
         raise ConfigurationValidationError("CPU limit is outside configured bounds")
-    if not bounds.min_memory_request_bytes <= memory_request <= bounds.max_memory_request_bytes:
+    if memory_request > bounds.max_memory_request_bytes or (
+        not allow_below_minimum_resources and memory_request < bounds.min_memory_request_bytes
+    ):
         raise ConfigurationValidationError("memory request is outside configured bounds")
-    if not bounds.min_memory_limit_bytes <= memory_limit <= bounds.max_memory_limit_bytes:
+    if memory_limit > bounds.max_memory_limit_bytes or (
+        not allow_below_minimum_resources and memory_limit < bounds.min_memory_limit_bytes
+    ):
         raise ConfigurationValidationError("memory limit is outside configured bounds")
     if cpu_request > cpu_limit:
         raise ConfigurationValidationError("CPU request cannot exceed CPU limit")
@@ -120,12 +140,22 @@ def extract_features(result: Mapping[str, Any]) -> dict[str, Any]:
 
     available = values("available_replicas", ("ready_replicas",))
     oom_values = [metrics.get("oom_killed") for metrics in metric_sets if metrics.get("oom_killed") is not None]
+    pod_kill_recovery_states = [
+        metrics.get("pod_kill_recovered")
+        for metrics in metric_sets
+        if isinstance(metrics.get("pod_kill_recovered"), bool)
+    ]
     pod_kill_recovery = max(values("pod_kill_recovery_seconds"), default=None)
     return {
         "max_p95_latency_ms": max(values("p95_latency_ms", ("p95_ms",)), default=None),
         "max_p99_latency_ms": max(values("p99_latency_ms", ("p99_ms",)), default=None),
         "max_error_rate_percent": max(values("error_rate_percent", ("error_rate",)), default=None),
         "pod_kill_recovery_seconds": pod_kill_recovery,
+        "pod_kill_recovered": (
+            False if False in pod_kill_recovery_states
+            else True if pod_kill_recovery_states
+            else None
+        ),
         "max_recovery_time_seconds": pod_kill_recovery,
         "min_available_replicas": min(available, default=None),
         "oom_killed": any(bool(value) for value in oom_values) if oom_values else None,
@@ -149,7 +179,21 @@ def evaluate_constraints(features: Mapping[str, Any], constraints: OptimizationC
     add("p95_latency_ms", features.get("max_p95_latency_ms"), constraints.max_p95_latency_ms, "<=", constraints.max_p95_latency_ms is None)
     add("p99_latency_ms", features.get("max_p99_latency_ms"), constraints.max_p99_latency_ms, "<=", constraints.max_p99_latency_ms is None)
     add("error_rate_percent", features.get("max_error_rate_percent"), constraints.max_error_rate_percent, "<=", constraints.max_error_rate_percent is None)
-    add("pod_kill_recovery_seconds", features.get("pod_kill_recovery_seconds"), constraints.max_recovery_time_seconds, "<=", constraints.max_recovery_time_seconds is None)
+    recovery_value = features.get("pod_kill_recovery_seconds")
+    if constraints.max_recovery_time_seconds is None:
+        add("pod_kill_recovery_seconds", recovery_value, None, "<=", True)
+    elif recovery_value is None and features.get("pod_kill_recovered") is False:
+        checks.append({
+            "name": "pod_kill_recovery_seconds",
+            "status": "FAIL",
+            "measured": None,
+            "limit": constraints.max_recovery_time_seconds,
+            "reason": "recovery_not_observed_before_timeout",
+            "recovered": False,
+        })
+    else:
+        add("pod_kill_recovery_seconds", recovery_value, constraints.max_recovery_time_seconds, "<=")
+        checks[-1]["recovered"] = features.get("pod_kill_recovered")
     add("available_replicas", features.get("min_available_replicas"), constraints.min_available_replicas, ">=")
     add("oom_killed", features.get("oom_killed"), False, "<=", constraints.oom_killed_allowed)
     return {"status": "PASS" if all(item["status"] in {"PASS", "SKIPPED"} for item in checks) else "FAIL", "checks": checks}
