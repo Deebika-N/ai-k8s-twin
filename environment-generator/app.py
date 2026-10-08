@@ -1,6 +1,7 @@
 import os
 import json
 from groq import Groq
+from config import EnvironmentConfig
 
 # Connect to Groq
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
@@ -75,6 +76,14 @@ except json.JSONDecodeError:
     print("Groq did not return valid JSON:")
     print(result)
     exit(1)
+
+environment["image"] = environment.get(
+    "image",
+    "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/paymentservice:v0.10.6",
+)
+environment["application_port"] = 50051
+validated = EnvironmentConfig.from_mapping(environment)
+environment.update(validated.as_mapping())
 
 # Save JSON
 output_file = "generated/environment.json"

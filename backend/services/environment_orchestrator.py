@@ -1,10 +1,14 @@
+import argparse
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import yaml
 from git import Repo
@@ -527,9 +531,13 @@ def deploy_application(
         f"to namespace {namespace}..."
     )
 
-    resource = find_application_resource(
-        application
-    )
+    resource = application.get("resource_override")
+    if resource is None:
+        resource = find_application_resource(
+            application
+        )
+    else:
+        resource = json.loads(json.dumps(resource))
 
     pod_spec = (
         resource
@@ -1633,14 +1641,67 @@ def collect_result_metrics(
         "p95_latency_ms": None,
         "p99_latency_ms": None,
         "error_rate_percent": None,
-        "pod_restarts": 0,
-        "available_replicas": 0,
-        "oom_killed": False,
-        "recovery_time_seconds": (
-            recovery_result.get(
-                "recovery_time_seconds"
-            )
+        "pod_restarts": None,
+        "available_replicas": None,
+        "oom_killed": None,
+        "pod_kill_recovered": (
+            recovery_result.get("recovered")
+            if recovery_result and recovery_result.get("environment") == "Pod Kill"
+            else None
+        ),
+        "pod_kill_recovery_seconds": (
+            recovery_result.get("pod_kill_recovery_seconds")
             if recovery_result
+            else None
+        ),
+        "chaos_apply_seconds": (
+            recovery_result.get("chaos_apply_seconds")
+            if recovery_result
+            else None
+        ),
+        "pod_disappearance_seconds": (
+            recovery_result.get("pod_disappearance_seconds")
+            if recovery_result
+            else None
+        ),
+        "replacement_pod_ready_seconds": (
+            recovery_result.get("replacement_pod_ready_seconds")
+            if recovery_result
+            else None
+        ),
+        "total_recovery_seconds": (
+            recovery_result.get("total_recovery_seconds")
+            if recovery_result
+            else None
+        ),
+        "cpu_stress_duration_seconds": (
+            recovery_result.get("stress_duration_seconds")
+            if recovery_result and recovery_result.get("environment") == "CPU Stress"
+            else None
+        ),
+        "cpu_cleanup_duration_seconds": (
+            recovery_result.get("cleanup_duration_seconds")
+            if recovery_result and recovery_result.get("environment") == "CPU Stress"
+            else None
+        ),
+        "cpu_readiness_recovery_seconds": (
+            recovery_result.get("readiness_recovery_seconds")
+            if recovery_result and recovery_result.get("environment") == "CPU Stress"
+            else None
+        ),
+        "memory_stress_duration_seconds": (
+            recovery_result.get("stress_duration_seconds")
+            if recovery_result and recovery_result.get("environment") == "Memory Stress"
+            else None
+        ),
+        "memory_cleanup_duration_seconds": (
+            recovery_result.get("cleanup_duration_seconds")
+            if recovery_result and recovery_result.get("environment") == "Memory Stress"
+            else None
+        ),
+        "memory_readiness_recovery_seconds": (
+            recovery_result.get("readiness_recovery_seconds")
+            if recovery_result and recovery_result.get("environment") == "Memory Stress"
             else None
         ),
         "collection_errors": [],
@@ -1656,7 +1717,18 @@ def collect_result_metrics(
             "pod_restarts": "kubectl pod status",
             "available_replicas": "kubectl deployment status",
             "oom_killed": "kubectl pod status",
-            "recovery_time_seconds": "Pod Kill recovery timer"
+            "pod_kill_recovered": "Pod Kill recovery event observation",
+            "pod_kill_recovery_seconds": "Pod Kill replacement readiness timer",
+            "chaos_apply_seconds": "Pod Kill kubectl apply interval",
+            "pod_disappearance_seconds": "Pod Kill target disappearance interval",
+            "replacement_pod_ready_seconds": "Pod Kill replacement readiness interval",
+            "total_recovery_seconds": "Pod Kill total recovery timer",
+            "cpu_stress_duration_seconds": "CPU Stress active interval",
+            "cpu_cleanup_duration_seconds": "CPU Stress Chaos cleanup interval",
+            "cpu_readiness_recovery_seconds": "CPU Stress readiness timer",
+            "memory_stress_duration_seconds": "Memory Stress active interval",
+            "memory_cleanup_duration_seconds": "Memory Stress Chaos cleanup interval",
+            "memory_readiness_recovery_seconds": "Memory Stress readiness timer",
         }
     }
 
@@ -1799,24 +1871,24 @@ def collect_result_metrics(
                 )
 
                 pod_stats = next(
-                    item for item in stats.get(
-                        "pods",
-                        []
-                    )
-                    if (
-                        item.get("podRef", {}).get("uid") == pod_uid
-                        or (
-                            item.get("podRef", {}).get("name")
-                            == pod_name
-                            and item.get("podRef", {}).get("namespace")
-                            == namespace
+                    (
+                        item for item in stats.get("pods", [])
+                        if (
+                            item.get("podRef", {}).get("uid") == pod_uid
+                            or (
+                                item.get("podRef", {}).get("name") == pod_name
+                                and item.get("podRef", {}).get("namespace") == namespace
+                            )
                         )
-                    )
+                    ),
+                    None,
                 )
-                container_stats = pod_stats.get(
-                    "containers",
-                    []
-                )[0]
+                if not pod_stats:
+                    raise RuntimeError("Kubelet stats did not contain the selected pod.")
+                containers = pod_stats.get("containers", [])
+                if not containers:
+                    raise RuntimeError("Kubelet stats did not contain a container.")
+                container_stats = containers[0]
                 cpu_usage = container_stats.get(
                     "cpu",
                     {}
@@ -1887,8 +1959,16 @@ def collect_result_metrics(
             ])
         )
 
-        for pod in pod_data.get("items", []):
+        pod_items = pod_data.get("items", [])
+        metrics["pod_restarts"] = 0
+        metrics["oom_killed"] = False
+        candidate_containers = {
+            container.get("name"): container
+            for container in application.get("containers", [])
+        }
+        candidate_container_observed = False
 
+        for pod in pod_items:
             statuses = pod.get(
                 "status",
                 {}
@@ -1896,8 +1976,21 @@ def collect_result_metrics(
                 "containerStatuses",
                 []
             )
+            pod_containers = {
+                container.get("name"): container
+                for container in pod.get("spec", {}).get("containers", [])
+            }
 
             for status in statuses:
+                candidate_container = candidate_containers.get(status.get("name"))
+                pod_container = pod_containers.get(status.get("name"))
+                if (
+                    candidate_container is None
+                    or pod_container is None
+                    or not pod_container_matches_candidate(pod_container, candidate_container)
+                ):
+                    continue
+                candidate_container_observed = True
 
                 metrics[
                     "pod_restarts"
@@ -1906,19 +1999,15 @@ def collect_result_metrics(
                     0
                 )
 
-                if status.get(
-                    "lastState",
-                    {}
-                ).get(
-                    "terminated",
-                    {}
-                ).get(
-                    "reason"
-                ) == "OOMKilled":
+                if container_was_oom_killed(status):
 
                     metrics[
                         "oom_killed"
                     ] = True
+
+        if not candidate_container_observed:
+            metrics["pod_restarts"] = None
+            metrics["oom_killed"] = None
 
     except (
         RuntimeError,
@@ -1994,6 +2083,43 @@ def collect_result_metrics(
         )
 
     return metrics
+
+
+def container_was_oom_killed(container_status):
+    """Check both a current termination and the most recent container termination."""
+    current_state = container_status.get("state") or {}
+    last_state = container_status.get("lastState") or {}
+    return any(
+        state.get("reason") == "OOMKilled"
+        for state in (
+            current_state.get("terminated", {}),
+            last_state.get("terminated", {}),
+        )
+    )
+
+
+def pod_container_matches_candidate(pod_container, candidate_container):
+    """Ignore stale ReplicaSet pods whose resource settings differ from this run."""
+    if pod_container.get("name") != candidate_container.get("name"):
+        return False
+    expected = candidate_container.get("resources", {})
+    if not expected:
+        return True
+    actual = pod_container.get("resources", {})
+    from services.optimization_policy import cpu_millicores, memory_bytes
+
+    parsers = {"cpu": cpu_millicores, "memory": memory_bytes}
+    for group in ("requests", "limits"):
+        expected_group = expected.get(group, {})
+        actual_group = actual.get(group, {})
+        for resource in ("cpu", "memory"):
+            if resource in expected_group:
+                try:
+                    if parsers[resource](actual_group.get(resource)) != parsers[resource](expected_group[resource]):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+    return True
 
 
 def scale_application(
@@ -2695,6 +2821,158 @@ def wait_for_application_recovery(
     return False
 
 
+def wait_for_pod_kill_recovery(
+    application,
+    killed_pod,
+    timeout=120,
+    pre_chaos_pods=None,
+):
+    """Observe a post-Chaos pod replacement or container restart becoming Ready."""
+    namespace = application.get("namespace", "default")
+    target_app = get_target_app(application)
+    expected_replicas = int(application.get("replicas", 1))
+    original_pods = pre_chaos_pods or [killed_pod]
+
+    def pod_identity(pod):
+        metadata = pod.get("metadata", {})
+        return metadata.get("uid") or metadata.get("name")
+
+    original_pods_by_id = {pod_identity(pod): pod for pod in original_pods}
+    original_pod_ids = set(original_pods_by_id)
+    deadline = time.time() + timeout
+    pod_disappeared_at = None
+    container_restart_detected_at = {}
+    replacement_pod_observed_at = None
+    detected_killed_pod = killed_pod.get("metadata", {}).get("name")
+
+    def pod_is_ready(pod):
+        status = pod.get("status", {})
+        container_statuses = status.get("containerStatuses", [])
+        return (
+            status.get("phase") == "Running"
+            and bool(container_statuses)
+            and all(container.get("ready", False) for container in container_statuses)
+        )
+
+    while time.time() < deadline:
+        try:
+            data = json.loads(run_command([
+                "kubectl", "get", "pods", "-n", namespace,
+                "-l", f"app={target_app}", "-o", "json",
+            ]))
+            pods = data.get("items", [])
+            current_pods_by_id = {pod_identity(pod): pod for pod in pods}
+            missing_originals = [
+                original_pods_by_id[pod_id]
+                for pod_id in original_pod_ids
+                if pod_id not in current_pods_by_id
+            ]
+            if missing_originals and pod_disappeared_at is None:
+                pod_disappeared_at = time.time()
+                detected_killed_pod = missing_originals[0].get("metadata", {}).get("name")
+
+            deleting_originals = [
+                pod for pod_id, pod in current_pods_by_id.items()
+                if pod_id in original_pod_ids and (
+                    pod.get("metadata", {}).get("deletionTimestamp")
+                    or pod.get("status", {}).get("phase") in {"Succeeded", "Failed"}
+                )
+            ]
+            if deleting_originals:
+                detected_killed_pod = deleting_originals[0].get("metadata", {}).get("name")
+
+            ready_pods = [
+                pod for pod in pods
+                if pod_is_ready(pod)
+            ]
+            replacement_pods = [
+                pod for pod in pods
+                if pod_identity(pod) not in original_pod_ids
+            ]
+            if replacement_pods and replacement_pod_observed_at is None:
+                replacement_pod_observed_at = time.time()
+            for original_id, original_pod in original_pods_by_id.items():
+                same_pod = current_pods_by_id.get(original_id)
+                if same_pod is None:
+                    continue
+                original_restart_counts = {
+                    status.get("name"): status.get("restartCount", 0)
+                    for status in original_pod.get("status", {}).get("containerStatuses", [])
+                }
+                current_restart_counts = {
+                    status.get("name"): status.get("restartCount", 0)
+                    for status in same_pod.get("status", {}).get("containerStatuses", [])
+                }
+                restart_observed = any(
+                    current_restart_counts.get(name, 0) > restart_count
+                    for name, restart_count in original_restart_counts.items()
+                )
+                if restart_observed and original_id not in container_restart_detected_at:
+                    container_restart_detected_at[original_id] = time.time()
+                    detected_killed_pod = same_pod.get("metadata", {}).get("name")
+                if (
+                    restart_observed
+                    and pod_is_ready(same_pod)
+                    and len(ready_pods) >= expected_replicas
+                ):
+                    ready_at = time.time()
+                    return {
+                        "recovered": True,
+                        "killed_pod": same_pod.get("metadata", {}).get("name"),
+                        "replacement_ready_replicas": len(ready_pods),
+                        "pod_disappeared_at": None,
+                        "recovery_event_at": container_restart_detected_at[original_id],
+                        "replacement_pod_ready_at": ready_at,
+                        "recovery_mode": "container_restart",
+                        "poll_interval_seconds": 3,
+                    }
+
+            replacement_ready_pods = [
+                pod for pod in replacement_pods
+                if pod_is_ready(pod)
+            ]
+            if (
+                (missing_originals or deleting_originals)
+                and replacement_ready_pods
+                and len(ready_pods) >= expected_replicas
+            ):
+                ready_at = time.time()
+                return {
+                    "recovered": True,
+                    "killed_pod": detected_killed_pod,
+                    "replacement_ready_replicas": len(ready_pods),
+                    "pod_disappeared_at": pod_disappeared_at,
+                    "recovery_event_at": (
+                        pod_disappeared_at
+                        if pod_disappeared_at is not None
+                        else replacement_pod_observed_at
+                    ),
+                    "replacement_pod_ready_at": ready_at,
+                    "recovery_mode": "pod_replacement",
+                    "poll_interval_seconds": 3,
+                }
+        except (RuntimeError, json.JSONDecodeError):
+            pass
+        time.sleep(3)
+
+    return {
+        "recovered": False,
+        "killed_pod": detected_killed_pod,
+        "replacement_ready_replicas": None,
+        "pod_disappeared_at": pod_disappeared_at,
+        "recovery_event_at": (
+            next(iter(container_restart_detected_at.values()), None)
+            if container_restart_detected_at
+            else replacement_pod_observed_at
+            if replacement_pod_observed_at is not None
+            else pod_disappeared_at
+        ),
+        "replacement_pod_ready_at": None,
+        "poll_interval_seconds": 3,
+        "reason": "POD_REPLACEMENT_NOT_READY",
+    }
+
+
 def execute_pod_kill(
     application,
     yaml_file
@@ -2717,23 +2995,47 @@ def execute_pod_kill(
         "========================================"
     )
 
+    pods = json.loads(run_command([
+        "kubectl", "get", "pods", "-n", namespace,
+        "-l", f"app={get_target_app(application)}", "-o", "json",
+    ])).get("items", [])
+    if not pods:
+        raise RuntimeError("Cannot measure Pod Kill recovery: no target pod exists")
+    killed_pod = pods[0]
     start_time = time.time()
-
+    print(f"[pod-kill] timer started for pod {killed_pod.get('metadata', {}).get('name')}")
     apply_chaos_file(
         yaml_file
     )
+    chaos_applied_at = time.time()
+    chaos_apply_seconds = chaos_applied_at - start_time
+    print(f"[pod-kill] chaos_apply_seconds={chaos_apply_seconds:.3f}")
 
     print(
         "\nPod Kill is active."
     )
 
-    recovered = (
-        wait_for_application_recovery(
-            application
-        )
+    recovery = wait_for_pod_kill_recovery(
+        application,
+        killed_pod,
+        pre_chaos_pods=pods,
     )
 
     recovery_time = time.time() - start_time
+    pod_disappearance_seconds = (
+        recovery["pod_disappeared_at"] - chaos_applied_at
+        if recovery.get("pod_disappeared_at") is not None
+        else None
+    )
+    recovery_event_at = recovery.get("recovery_event_at") or recovery.get("pod_disappeared_at")
+    replacement_pod_ready_seconds = (
+        recovery["replacement_pod_ready_at"] - recovery_event_at
+        if recovery.get("replacement_pod_ready_at") is not None and recovery_event_at is not None
+        else None
+    )
+    print(f"[pod-kill] pod_disappearance_seconds={pod_disappearance_seconds}")
+    print(f"[pod-kill] replacement_pod_ready_seconds={replacement_pod_ready_seconds}")
+    print(f"[pod-kill] total_recovery_seconds={recovery_time:.3f}")
 
     cleanup_chaos(
         namespace,
@@ -2746,11 +3048,16 @@ def execute_pod_kill(
         "environment": "Pod Kill",
         "start_time": start_time,
         "end_time": time.time(),
-        "recovered": recovered,
-        "recovery_time_seconds": recovery_time,
+        "recovered": recovery["recovered"],
+        "pod_kill_recovery_seconds": recovery_time if recovery["recovered"] else None,
+        "chaos_apply_seconds": chaos_apply_seconds,
+        "pod_disappearance_seconds": pod_disappearance_seconds,
+        "replacement_pod_ready_seconds": replacement_pod_ready_seconds,
+        "total_recovery_seconds": recovery_time,
+        "replacement": recovery,
         "status": (
             "completed"
-            if recovered
+            if recovery["recovered"]
             else "completed_without_confirmed_recovery"
         )
     }
@@ -2859,6 +3166,8 @@ def execute_five_chaos(
         ]
     )
 
+    cleanup_duration = time.time() - cleanup_started
+    readiness_started = time.time()
     recovered = (
         wait_for_application_recovery(
             application
@@ -2867,6 +3176,8 @@ def execute_five_chaos(
 
     recovery_time = time.time() - start_time
 
+    readiness_recovery = time.time() - readiness_started
+
     return {
         "environments": FIVE_CHAOS_ENVIRONMENTS,
         "start_time": start_time,
@@ -2874,7 +3185,9 @@ def execute_five_chaos(
         "duration": duration,
         "simultaneous": True,
         "recovered": recovered,
-        "recovery_time_seconds": recovery_time,
+        "stress_duration_seconds": stress_duration,
+        "cleanup_duration_seconds": cleanup_duration,
+        "readiness_recovery_seconds": readiness_recovery,
         "k6": k6_result,
         "status": "completed"
     }
@@ -2973,7 +3286,8 @@ def execute_node_failure(
         "end_time": time.time(),
         "duration": duration,
         "recovered": recovered,
-        "recovery_time_seconds": recovery_time,
+        "node_failure_duration_seconds": time.time() - start_time,
+        "readiness_recovery_seconds": None,
         "status": (
             "completed"
             if recovered
@@ -3536,6 +3850,59 @@ def generate_environment():
     return results
 
 
-if __name__ == "__main__":
+def generate_selected_environment():
+    from services.selected_experiment import run_selected_application
 
-    generate_environment()
+    parser = argparse.ArgumentParser(description="Run one selected Kubernetes workload experiment")
+    parser.add_argument("--application", help="workload name to test")
+    parser.add_argument("--list-applications", action="store_true", help="list discovered workloads and exit")
+    parser.add_argument("--repository-url", help="Git repository URL")
+    parser.add_argument("--available-cpu", default="2")
+    parser.add_argument("--available-memory", default="4Gi")
+    parser.add_argument("--vus", type=int, default=5)
+    parser.add_argument("--duration", default="20s")
+    args = parser.parse_args()
+
+    github_url = args.repository_url or input("\nGitHub repository URL: ").strip()
+    if not github_url:
+        raise ValueError("GitHub repository URL is required.")
+
+    project_path = clone_repository(github_url)
+    resources = []
+    for yaml_file in find_yaml_files(project_path):
+        resources.extend(parse_yaml_file(yaml_file))
+    workloads = get_workloads(analyze_resources(resources))
+
+    print("\nAvailable applications:")
+    for index, workload in enumerate(workloads, start=1):
+        print(f"  {index}. {workload.get('name')} ({workload.get('kind')}, {workload.get('namespace', 'default')})")
+    if args.list_applications:
+        return workloads
+
+    application_name = args.application
+    if not application_name:
+        default_name = "adservice"
+        application_name = default_name if any(item.get("name") == default_name for item in workloads) else workloads[0].get("name")
+    application = next((item for item in workloads if item.get("name") == application_name), None)
+    if application is None:
+        raise ValueError(f"Application not found: {application_name}")
+
+    print(f"\nSelected application: {application_name}")
+    result = run_selected_application(
+        application,
+        available_cpu=args.available_cpu,
+        available_memory=args.available_memory,
+        vus=args.vus,
+        duration=args.duration,
+    )
+    result_file = os.path.join(GENERATED_DIRECTORY, f"{application_name}-selected-result.json")
+    os.makedirs(GENERATED_DIRECTORY, exist_ok=True)
+    with open(result_file, "w", encoding="utf-8") as file:
+        json.dump(result, file, indent=2)
+    print(f"\nStructured result saved: {result_file}")
+    print(f"Run status: {result.get('status', 'FAILED')}")
+    return result
+
+
+if __name__ == "__main__":
+    generate_selected_environment()
