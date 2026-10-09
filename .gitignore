@@ -15,3 +15,26 @@ backend/generated/
 
 # VS Code
 .vscode/
+
+# Additional environment and editor files
+.venv/
+.env.*
+!.env.example
+*.log
+.DS_Store
+*:Zone.Identifier
+
+# Temporary cloned repositories
+temp_repository/
+
+# Local Kubernetes binary
+/kubectl
+
+# Node.js dependencies and build output
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# Windows metadata files
+*:Zone.Identifier

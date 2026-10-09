@@ -3330,7 +3330,14 @@ def process_application(
             )
 
 
-def generate_environment():
+def run_environment(
+    github_url,
+    cpu,
+    memory,
+    vus,
+    duration,
+    environments=None
+):
 
     print(
         "\n========================================"
@@ -3344,33 +3351,12 @@ def generate_environment():
         "========================================"
     )
 
-    github_url = input(
-        "\nGitHub repository URL: "
-    ).strip()
-
     if not github_url:
-
         raise ValueError(
             "GitHub repository URL is required."
         )
 
-    cpu = input(
-        "Available CPU: "
-    ).strip()
-
-    memory = input(
-        "Available memory: "
-    ).strip()
-
-    vus = input(
-        "k6 VUs: "
-    ).strip()
-
-    duration = input(
-        "Experiment duration: "
-    ).strip()
-
-    environments = [
+    environments = environments or [
         "Pod Kill",
         "CPU Stress",
         "Memory Stress",
@@ -3534,6 +3520,16 @@ def generate_environment():
     )
 
     return results
+
+
+def generate_environment():
+    return run_environment(
+        github_url=input("\nGitHub repository URL: ").strip(),
+        cpu=input("Available CPU: ").strip(),
+        memory=input("Available memory: ").strip(),
+        vus=input("k6 VUs: ").strip(),
+        duration=input("Experiment duration: ").strip()
+    )
 
 
 if __name__ == "__main__":
